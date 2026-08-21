@@ -215,7 +215,10 @@ ResearchMate/
 
 ## 15. Screenshots
 
-*(placeholder — add screenshots of the sidebar, chat interface, and debug mode here)*
+<img width="1915" height="910" alt="RAG4" src="https://github.com/user-attachments/assets/2e7ef29c-10f5-4968-b171-0a62c3b49398" />
+
+<img width="1791" height="907" alt="Screenshot 2026-08-21 173950" src="https://github.com/user-attachments/assets/3a21b630-a8f8-40fa-bcdd-4d3ba03f7ab0" />
+
 
 ## 16. Author
 
