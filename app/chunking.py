@@ -66,14 +66,24 @@ class Chunk:
     document_id: str
     chunk_id: str   # globally unique across the whole knowledge base
 
-    def metadata(self) -> dict:
-        """Metadata dict in the shape ChromaDB expects (flat, JSON-safe)."""
-        return {
+    def metadata(self, content_hash: str | None = None) -> dict:
+        """
+        Metadata dict in the shape ChromaDB expects (flat, JSON-safe).
+
+        content_hash (V2): a hash of the source PDF's bytes, stamped
+        onto every chunk from that document. Lets vector_store.py
+        detect "same filename, different content" and re-index rather
+        than silently skip — see VectorStore.get_document_hashes().
+        """
+        meta = {
             "source": self.source,
             "page": self.page,
             "document_id": self.document_id,
             "chunk_id": self.chunk_id,
         }
+        if content_hash:
+            meta["content_hash"] = content_hash
+        return meta
 
 
 def chunk_pages(
@@ -97,18 +107,6 @@ def chunk_pages(
     Returns:
         A flat list of Chunk objects, each with a unique chunk_id.
     """
-    if chunk_size is None or chunk_overlap is None:
-        return []
-    if not isinstance(chunk_size, int) or not isinstance(chunk_overlap, int):
-        try:
-            chunk_size = int(chunk_size)
-            chunk_overlap = int(chunk_overlap)
-        except (TypeError, ValueError):
-            return []
-
-    if chunk_size <= 0 or chunk_overlap < 0 or chunk_overlap >= chunk_size:
-        return []
-
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,

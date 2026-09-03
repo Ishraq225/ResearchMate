@@ -1,33 +1,23 @@
-# Virtual environments
-.venv/
-venv/
-env/
-
-# Python cache
-__pycache__/
-*.py[cod]
-
-# Pytest
-.pytest_cache/
-
-# Environment variables
+# Secrets
 .env
 
-# Vector database
-data/vector_store/
-vector_store/
-chroma_db/
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
 
-# Jupyter
-.ipynb_checkpoints/
+# Vector DB + uploaded docs (generated at runtime, shouldn't be in git)
+data/vector_store/*
+!data/vector_store/.gitkeep
+data/documents/*
+!data/documents/.gitkeep
 
-# IDE
+# OS / editor
+.DS_Store
 .vscode/
 .idea/
 
-# OS
-.DS_Store
-Thumbs.db
-
-# Logs
-*.log
+# Streamlit
+.streamlit/

@@ -2,102 +2,74 @@
 app.py
 ======
 
-Streamlit UI for ResearchMate.
+Streamlit UI for ResearchMate V2.
 
-WHY app.py STAYS THIN
+WHY app.py STAYS THIN (unchanged principle from V1)
+--------------------------------------------------------
+Every meaningful decision (which documents to search, how much
+history to include, whether evidence is sufficient) is made inside
+app/*.py modules and is independently testable. This file only wires
+widgets to those modules and renders results — it still contains no
+retrieval or generation logic of its own.
+
+WHAT CHANGED FROM V1
 -------------------------
-Every function called here (process_documents, Retriever.retrieve,
-Generator.generate_answer, VectorStore.reset) is fully implemented in
-app/*.py and testable in isolation, without Streamlit running.
-
-This file's only job is:
-- render widgets
-- read user input
-- call the pipeline
-- render output
-- measure performance
-
-Keeping business logic OUT of app.py keeps the retrieval layer
-independent from the UI.
+- Sidebar now lists documents individually with checkboxes (document
+  selection/filtering — V2 feature) instead of just a flat name list.
+- A research-mode selector (Ask/Summarize/Compare/Explain/Find
+  Evidence) drives which prompt strategy generator.py uses.
+- Conversation memory is now owned by app.memory.ConversationMemory
+  instead of a raw list in session_state, with explicit "New Chat" /
+  "Clear Conversation" actions.
+- Chat rendered with st.chat_message / st.chat_input instead of a
+  manual text_input + button, per the V2 UI requirements.
+- Insufficient-evidence responses are visually distinguished so users
+  don't mistake "no evidence found" for a real grounded answer.
 """
 
 from __future__ import annotations
-
-import tempfile
-import time
-from pathlib import Path
 
 import streamlit as st
 
 from app.config import DEBUG_MODE, TOP_K
 from app.embeddings import EmbeddingError, EmbeddingManager
 from app.generator import Generator, GenerationError
+from app.memory import ConversationMemory
 from app.pipeline import process_documents
+from app.research_modes import ResearchMode
 from app.retriever import Retriever
 from app.vector_store import VectorStore, VectorStoreError
 
-
-# ----------------------------------------------------------------------
-# Streamlit configuration
-# ----------------------------------------------------------------------
-
-st.set_page_config(
-    page_title="ResearchMate",
-    page_icon="📄",
-    layout="wide",
-)
+st.set_page_config(page_title="ResearchMate", page_icon="📄", layout="wide")
 
 
 # ----------------------------------------------------------------------
 # Cached / session-persistent resources
 # ----------------------------------------------------------------------
-
 @st.cache_resource
 def get_embedding_manager() -> EmbeddingManager:
-    """
-    Cached across reruns and sessions within this process.
-
-    The embedding model is expensive to load, so we only load it once.
-    """
     return EmbeddingManager()
 
 
 @st.cache_resource
 def get_vector_store() -> VectorStore:
-    """
-    Persistent ChromaDB connection.
-
-    One VectorStore instance is reused by the Streamlit process.
-    """
     return VectorStore()
 
 
 def get_generator() -> Generator:
-    """
-    Creating a Generator is cheap because it only wraps the LLM provider.
-
-    It is intentionally not cached so changes to the LLM_PROVIDER
-    environment variable can take effect without restarting the app.
-    """
+    """Not cached: cheap to construct, and lets LLM_PROVIDER changes take effect live."""
     return Generator()
 
 
-# ----------------------------------------------------------------------
-# Session state
-# ----------------------------------------------------------------------
-
 def init_session_state() -> None:
-    """Initialize Streamlit session state variables."""
-
     defaults = {
         "uploaded_filenames": [],
         "pending_files": [],
-        "chat_history": [],
-        "last_sources": [],
-        "last_debug": None,
+        "memory": ConversationMemory(),
+        "selected_document_ids": set(),  # empty set = "no documents selected"
         "debug_mode": DEBUG_MODE,
+        "research_mode": ResearchMode.ASK.value,
     }
-
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
@@ -107,539 +79,241 @@ init_session_state()
 
 
 # ----------------------------------------------------------------------
-# Sidebar: document management
+# Sidebar: document management + selection + conversation controls
 # ----------------------------------------------------------------------
-
 with st.sidebar:
-
     st.header("📚 Documents")
 
     uploaded = st.file_uploader(
-        "Upload PDFs",
-        type=["pdf"],
-        accept_multiple_files=True,
-        key="uploader",
+        "Upload PDFs", type=["pdf"], accept_multiple_files=True, key="uploader"
     )
 
     if uploaded:
-
         from app.config import DOCUMENTS_DIR
 
         saved_paths = []
-
         for f in uploaded:
-
             dest = DOCUMENTS_DIR / f.name
-
             if not dest.exists():
                 dest.write_bytes(f.getbuffer())
-
             saved_paths.append(dest)
-
             if f.name not in st.session_state.uploaded_filenames:
                 st.session_state.uploaded_filenames.append(f.name)
-
         st.session_state.pending_files = saved_paths
 
-    # --------------------------------------------------------------
-    # Display uploaded files
-    # --------------------------------------------------------------
-
-    if st.session_state.uploaded_filenames:
-
-        st.markdown("**Uploaded:**")
-
-        for name in st.session_state.uploaded_filenames:
-            st.markdown(f"✓ {name}")
-
-    # --------------------------------------------------------------
-    # Sidebar buttons
-    # --------------------------------------------------------------
-
-    process_clicked = st.button(
-        "⚙️ Process Documents",
-        use_container_width=True,
-    )
-
-    clear_clicked = st.button(
-        "🗑️ Clear Knowledge Base",
-        use_container_width=True,
-    )
+    process_clicked = st.button("⚙️ Process Documents", use_container_width=True)
+    clear_kb_clicked = st.button("🗑️ Clear Knowledge Base", use_container_width=True)
 
     st.divider()
 
-    # --------------------------------------------------------------
-    # Knowledge base statistics
-    # --------------------------------------------------------------
-
+    # --- Document selection (V2): one checkbox per indexed document ---
     try:
-
         vs = get_vector_store()
-
-        chunk_count = vs.count()
-        doc_count = len(vs.get_indexed_document_ids())
-
-        status = "Ready" if chunk_count > 0 else "Empty"
-
+        registry = vs.get_document_registry()  # {document_id: filename}
     except VectorStoreError as exc:
+        registry = {}
+        st.error(f"Couldn't load document list: {exc}")
 
-        chunk_count = 0
-        doc_count = 0
-        status = f"Error: {exc}"
+    if registry:
+        st.markdown("**Selected Sources**")
+        if "selected_document_ids" not in st.session_state or not st.session_state.selected_document_ids:
+            # Default: everything selected on first load so new users
+            # get sensible behavior without manually ticking boxes.
+            st.session_state.selected_document_ids = set(registry.keys())
+
+        for doc_id, filename in sorted(registry.items(), key=lambda kv: kv[1].lower()):
+            checked = st.checkbox(
+                filename, value=doc_id in st.session_state.selected_document_ids, key=f"doc_select_{doc_id}"
+            )
+            if checked:
+                st.session_state.selected_document_ids.add(doc_id)
+            else:
+                st.session_state.selected_document_ids.discard(doc_id)
+    else:
+        st.caption("No documents indexed yet.")
+
+    st.divider()
+
+    # --- Knowledge base stats ---
+    try:
+        chunk_count = vs.count()
+        doc_count = len(registry)
+        status = "Ready" if chunk_count > 0 else "Empty"
+    except VectorStoreError as exc:
+        chunk_count, doc_count, status = 0, 0, f"Error: {exc}"
 
     st.markdown("**Knowledge Base**")
-
-    st.markdown(f"Documents: {doc_count}")
-
-    st.markdown(f"Chunks: {chunk_count:,}")
-
-    st.markdown(f"Status: {status}")
+    col1, col2 = st.columns(2)
+    col1.metric("Documents", doc_count)
+    col2.metric("Chunks", chunk_count)
+    st.caption(f"Status: {status}")
 
     st.divider()
 
-    # --------------------------------------------------------------
-    # Debug mode
-    # --------------------------------------------------------------
+    st.markdown("**Chat**")
+    new_chat_clicked = st.button("🆕 New Chat", use_container_width=True)
+    clear_chat_clicked = st.button("🧹 Clear Conversation", use_container_width=True)
 
+    st.divider()
     st.session_state.debug_mode = st.checkbox(
-        "🔍 Debug mode",
-        value=st.session_state.debug_mode,
-        help=(
-            "Show the retrieved chunks, similarity scores, "
-            "full prompt sent to the LLM, and performance timings."
-        ),
+        "🔍 Debug mode", value=st.session_state.debug_mode,
+        help="Show retrieved chunks, similarity scores, and the full prompt sent to the LLM.",
     )
 
 
 # ----------------------------------------------------------------------
-# Handle: Clear Knowledge Base
+# Handle sidebar button actions
 # ----------------------------------------------------------------------
-
-if clear_clicked:
-
+if clear_kb_clicked:
     try:
-
         get_vector_store().reset()
-
         st.session_state.uploaded_filenames = []
         st.session_state.pending_files = []
-        st.session_state.chat_history = []
-        st.session_state.last_sources = []
-        st.session_state.last_debug = None
-
-        st.sidebar.success(
-            "Knowledge base cleared."
-        )
-
+        st.session_state.selected_document_ids = set()
+        st.session_state.memory.clear()
+        st.sidebar.success("Knowledge base cleared.")
     except VectorStoreError as exc:
+        st.sidebar.error(f"Couldn't clear the knowledge base: {exc}")
 
-        st.sidebar.error(
-            f"Couldn't clear the knowledge base: {exc}"
-        )
-
-
-# ----------------------------------------------------------------------
-# Handle: Process Documents
-# ----------------------------------------------------------------------
+if new_chat_clicked or clear_chat_clicked:
+    st.session_state.memory.new_chat()
+    st.sidebar.success("Conversation cleared.")
 
 if process_clicked:
-
     if not st.session_state.pending_files:
-
-        st.sidebar.warning(
-            "Upload at least one PDF first."
-        )
-
+        st.sidebar.warning("Upload at least one PDF first.")
     else:
-
-        with st.spinner(
-            "Processing documents "
-            "(extracting text, chunking, embedding)..."
-        ):
-
+        with st.spinner("Processing documents (extracting text, chunking, embedding)..."):
             try:
-
                 report = process_documents(
                     st.session_state.pending_files,
                     vector_store=get_vector_store(),
                     embedding_manager=get_embedding_manager(),
                 )
-
-                # --------------------------------------------------
-                # Successfully processed files
-                # --------------------------------------------------
-
                 if report.files_processed:
-
-                    st.sidebar.success(
-                        f"Indexed "
-                        f"{len(report.files_processed)} file(s), "
-                        f"{report.chunks_added} chunk(s) added."
-                    )
-
-                # --------------------------------------------------
-                # Skipped files
-                # --------------------------------------------------
-
-                if report.files_skipped:
-
+                    st.sidebar.success(f"Indexed {len(report.files_processed)} new file(s).")
+                if report.files_reprocessed:
                     st.sidebar.info(
-                        "Skipped (already indexed): "
-                        + ", ".join(report.files_skipped)
+                        f"Re-indexed (content changed): {', '.join(report.files_reprocessed)}"
                     )
-
-                # --------------------------------------------------
-                # Failed files
-                # --------------------------------------------------
-
+                if report.files_skipped:
+                    st.sidebar.info(f"Skipped (unchanged): {', '.join(report.files_skipped)}")
                 for fname, err in report.files_failed.items():
-
-                    st.sidebar.error(
-                        f"{fname}: {err}"
-                    )
-
+                    st.sidebar.error(f"{fname}: {err}")
+                # Newly indexed documents should be selected by default.
+                st.session_state.selected_document_ids = set(get_vector_store().get_document_registry().keys())
             except EmbeddingError as exc:
-
-                st.sidebar.error(
-                    f"Embedding failed: {exc}"
-                )
-
+                st.sidebar.error(f"Embedding failed: {exc}")
             except VectorStoreError as exc:
-
-                st.sidebar.error(
-                    f"Vector store failed: {exc}"
-                )
+                st.sidebar.error(f"Vector store failed: {exc}")
 
 
 # ----------------------------------------------------------------------
-# Main area: Chat interface
+# Main area
 # ----------------------------------------------------------------------
-
 st.title("ResearchMate")
+st.caption("Your AI research assistant for understanding academic papers.")
 
-st.caption(
-    "Your AI research assistant for understanding academic papers."
+mode_tabs = [m.value for m in ResearchMode]
+st.session_state.research_mode = st.radio(
+    "Research Mode", mode_tabs, horizontal=True,
+    index=mode_tabs.index(st.session_state.research_mode),
 )
 
-st.subheader("💬 Ask ResearchMate")
-
-
-query = st.text_input(
-    "Ask a question about your uploaded papers",
-    key="query_input",
-)
-
-ask_clicked = st.button("Ask")
-
-
-# ----------------------------------------------------------------------
-# Handle user question
-# ----------------------------------------------------------------------
-
-if ask_clicked:
-
-    # --------------------------------------------------------------
-    # Empty question
-    # --------------------------------------------------------------
-
-    if not query or not query.strip():
-
-        st.warning(
-            "Please enter a question."
-        )
-
-    # --------------------------------------------------------------
-    # No documents
-    # --------------------------------------------------------------
-
-    elif get_vector_store().count() == 0:
-
-        st.warning(
-            "No documents indexed yet. "
-            "Upload and process a PDF first."
-        )
-
-    # --------------------------------------------------------------
-    # Process question
-    # --------------------------------------------------------------
-
-    else:
-
-        with st.spinner(
-            "Retrieving relevant passages and generating an answer..."
-        ):
-
-            try:
-
-                # ==================================================
-                # START TOTAL TIMER
-                # ==================================================
-
-                total_start = time.perf_counter()
-
-                # ==================================================
-                # 1. RETRIEVAL
-                # ==================================================
-
-                retrieval_start = time.perf_counter()
-
-                retriever = Retriever(
-                    get_vector_store(),
-                    get_embedding_manager(),
-                )
-
-                retrieved = retriever.retrieve(
-                    query,
-                    top_k=TOP_K,
-                )
-
-                retrieval_time = (
-                    time.perf_counter()
-                    - retrieval_start
-                )
-
-                # ==================================================
-                # 2. LLM GENERATION
-                # ==================================================
-
-                generation_start = time.perf_counter()
-
-                generator = get_generator()
-
-                result = generator.generate_answer(
-                    query,
-                    retrieved,
-                    chat_history=st.session_state.chat_history,
-                )
-
-                generation_time = (
-                    time.perf_counter()
-                    - generation_start
-                )
-
-                # ==================================================
-                # 3. TOTAL RESPONSE TIME
-                # ==================================================
-
-                total_time = (
-                    time.perf_counter()
-                    - total_start
-                )
-
-                # ==================================================
-                # PRINT PERFORMANCE TO TERMINAL
-                # ==================================================
-
-                print()
-                print("=" * 55)
-                print("ResearchMate Performance")
-                print("=" * 55)
-
-                print(
-                    f"Retrieval time:   "
-                    f"{retrieval_time:.2f} seconds"
-                )
-
-                print(
-                    f"Generation time:  "
-                    f"{generation_time:.2f} seconds"
-                )
-
-                print(
-                    f"Total time:       "
-                    f"{total_time:.2f} seconds"
-                )
-
-                print(
-                    f"Chunks retrieved: "
-                    f"{len(retrieved)}"
-                )
-
-                print("=" * 55)
-                print()
-
-                # ==================================================
-                # SAVE CHAT HISTORY
-                # ==================================================
-
-                st.session_state.chat_history.append(
-                    (
-                        query,
-                        result.answer,
+# --- Render conversation history using chat bubbles ---
+for turn in st.session_state.memory.turns:
+    with st.chat_message("user"):
+        st.markdown(turn.user_message)
+    with st.chat_message("assistant"):
+        st.markdown(turn.assistant_message)
+        if turn.sources:
+            with st.expander("📚 Sources"):
+                for chunk in turn.sources:
+                    st.markdown(
+                        f"📄 **{chunk.source}** — Page {chunk.page} "
+                        f"(similarity: {chunk.similarity:.2f})"
                     )
-                )
+                    st.caption(chunk.text[:300] + ("..." if len(chunk.text) > 300 else ""))
 
-                # ==================================================
-                # SAVE SOURCES
-                # ==================================================
+# --- Chat input ---
+placeholder = {
+    ResearchMode.ASK.value: "Ask a question about your selected papers...",
+    ResearchMode.SUMMARIZE.value: "Press enter to summarize the selected documents (or add focus instructions)...",
+    ResearchMode.COMPARE.value: "What would you like to compare across the selected papers?",
+    ResearchMode.EXPLAIN.value: "What concept would you like explained?",
+    ResearchMode.FIND_EVIDENCE.value: "State the claim you want evidence for or against...",
+}[st.session_state.research_mode]
 
-                st.session_state.last_sources = result.sources
+user_input = st.chat_input(placeholder)
 
-                # ==================================================
-                # SAVE DEBUG INFORMATION
-                # ==================================================
+if user_input is not None:
+    query = user_input.strip()
+    allow_empty = st.session_state.research_mode in (ResearchMode.SUMMARIZE.value, ResearchMode.COMPARE.value)
 
-                if st.session_state.debug_mode:
+    if not query and not allow_empty:
+        st.warning("Please enter a question.")
+    elif get_vector_store().count() == 0:
+        st.warning("No documents indexed yet. Upload and process a PDF first.")
+    elif not st.session_state.selected_document_ids:
+        st.warning("No documents selected. Check at least one document in the sidebar.")
+    else:
+        with st.chat_message("user"):
+            st.markdown(query if query else f"({st.session_state.research_mode} — no specific query)")
 
-                    st.session_state.last_debug = {
-                        "query": query,
-                        "retrieved": retrieved,
-                        "prompt": result.prompt_used,
-                        "retrieval_time": retrieval_time,
-                        "generation_time": generation_time,
-                        "total_time": total_time,
-                    }
+        with st.chat_message("assistant"):
+            with st.spinner("Retrieving relevant passages and generating an answer..."):
+                try:
+                    retriever = Retriever(get_vector_store(), get_embedding_manager())
+                    retrieved = retriever.retrieve(
+                        query or st.session_state.research_mode,
+                        top_k=TOP_K,
+                        document_ids=list(st.session_state.selected_document_ids),
+                    )
 
-            # ------------------------------------------------------
-            # Error handling
-            # ------------------------------------------------------
+                    generator = get_generator()
+                    result = generator.generate_answer(
+                        query,
+                        retrieved,
+                        chat_history=st.session_state.memory.recent_history(),
+                        mode=st.session_state.research_mode,
+                    )
 
-            except EmbeddingError as exc:
+                    if result.insufficient_evidence:
+                        st.warning(result.answer)
+                    else:
+                        st.markdown(result.answer)
 
-                st.error(
-                    f"Couldn't embed your query: {exc}"
-                )
+                    if result.sources:
+                        with st.expander("📚 Sources", expanded=False):
+                            for chunk in result.sources:
+                                st.markdown(
+                                    f"📄 **{chunk.source}** — Page {chunk.page} "
+                                    f"(similarity: {chunk.similarity:.2f})"
+                                )
+                                st.caption(chunk.text[:300] + ("..." if len(chunk.text) > 300 else ""))
 
-            except VectorStoreError as exc:
+                    st.session_state.memory.add_turn(
+                        query, result.answer, sources=result.sources, mode=st.session_state.research_mode
+                    )
 
-                st.error(
-                    f"Vector store error: {exc}"
-                )
+                    if st.session_state.debug_mode:
+                        with st.expander("🔍 Debug: retrieval + prompt details", expanded=True):
+                            st.markdown(f"**Mode:** {st.session_state.research_mode}")
+                            st.markdown(f"**Documents searched:** {len(st.session_state.selected_document_ids)}")
+                            st.markdown("**Retrieved chunks (ranked):**")
+                            for i, chunk in enumerate(retrieved, start=1):
+                                st.markdown(
+                                    f"{i}. `{chunk.source}` p.{chunk.page} — "
+                                    f"distance={chunk.distance:.4f}, similarity={chunk.similarity:.2f}"
+                                )
+                            st.markdown("**System prompt:**")
+                            st.code(result.system_prompt_used, language="text")
+                            st.markdown("**Full prompt sent to the LLM:**")
+                            st.code(result.prompt_used, language="text")
 
-            except GenerationError as exc:
-
-                st.error(
-                    f"The LLM couldn't generate an answer: {exc}"
-                )
-
-
-# ----------------------------------------------------------------------
-# Render conversation history
-# ----------------------------------------------------------------------
-
-for i, (user_msg, assistant_msg) in enumerate(
-    st.session_state.chat_history
-):
-
-    st.markdown(
-        f"**You:** {user_msg}"
-    )
-
-    st.markdown("**Answer:**")
-
-    st.markdown(assistant_msg)
-
-    # --------------------------------------------------------------
-    # Show sources only under the latest answer
-    # --------------------------------------------------------------
-
-    if (
-        i == len(st.session_state.chat_history) - 1
-        and st.session_state.last_sources
-    ):
-
-        st.markdown("**📚 Sources**")
-
-        for chunk in st.session_state.last_sources:
-
-            with st.expander(
-                f"📄 {chunk.source} — "
-                f"Page {chunk.page} "
-                f"(similarity: {chunk.similarity:.2f})"
-            ):
-
-                st.write(chunk.text)
-
-    st.divider()
-
-
-# ----------------------------------------------------------------------
-# Debug panel
-# ----------------------------------------------------------------------
-
-if (
-    st.session_state.debug_mode
-    and st.session_state.last_debug
-):
-
-    with st.expander(
-        "🔍 Debug: retrieval + prompt + performance",
-        expanded=True,
-    ):
-
-        debug = st.session_state.last_debug
-
-        # ----------------------------------------------------------
-        # Query
-        # ----------------------------------------------------------
-
-        st.markdown(
-            f"**Query:** {debug['query']}"
-        )
-
-        # ----------------------------------------------------------
-        # Performance
-        # ----------------------------------------------------------
-
-        st.markdown("### ⚡ Performance")
-
-        col1, col2, col3 = st.columns(3)
-
-        with col1:
-
-            st.metric(
-                "Retrieval",
-                f"{debug['retrieval_time']:.2f}s",
-            )
-
-        with col2:
-
-            st.metric(
-                "LLM Generation",
-                f"{debug['generation_time']:.2f}s",
-            )
-
-        with col3:
-
-            st.metric(
-                "Total",
-                f"{debug['total_time']:.2f}s",
-            )
-
-        st.markdown(
-            f"**Chunks retrieved:** "
-            f"{len(debug['retrieved'])}"
-        )
-
-        # ----------------------------------------------------------
-        # Retrieved chunks
-        # ----------------------------------------------------------
-
-        st.markdown(
-            "### 📚 Retrieved chunks"
-        )
-
-        for i, chunk in enumerate(
-            debug["retrieved"],
-            start=1,
-        ):
-
-            st.markdown(
-                f"{i}. `{chunk.source}` "
-                f"p.{chunk.page} — "
-                f"distance={chunk.distance:.4f}, "
-                f"similarity={chunk.similarity:.2f}"
-            )
-
-        # ----------------------------------------------------------
-        # Full prompt
-        # ----------------------------------------------------------
-
-        st.markdown(
-            "### 🧠 Full prompt sent to the LLM"
-        )
-
-        st.code(
-            debug["prompt"],
-            language="text",
-        )
+                except EmbeddingError as exc:
+                    st.error(f"Couldn't embed your query: {exc}")
+                except VectorStoreError as exc:
+                    st.error(f"Vector store error: {exc}")
+                except GenerationError as exc:
+                    st.error(f"The LLM couldn't generate an answer: {exc}")

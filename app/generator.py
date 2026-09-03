@@ -30,13 +30,21 @@ from dataclasses import dataclass
 
 from app.config import (
     LLM_PROVIDER,
+    MIN_EVIDENCE_SIMILARITY,
     OLLAMA_BASE_URL,
     OLLAMA_MODEL,
     OPENAI_API_KEY,
     OPENAI_MODEL,
 )
-from app.prompts import SYSTEM_PROMPT, build_rag_prompt
+from app.prompts import build_rag_prompt
+from app.research_modes import ResearchMode, build_user_instruction, get_system_prompt
 from app.retriever import RetrievedChunk
+
+INSUFFICIENT_EVIDENCE_MESSAGE = (
+    "I couldn't find sufficient evidence in the selected documents to answer this "
+    "question reliably. Try rephrasing the question, selecting additional documents, "
+    "or confirming the relevant paper has been uploaded and processed."
+)
 
 
 class GenerationError(Exception):
@@ -73,16 +81,12 @@ class OllamaProvider(BaseLLMProvider):
         try:
             client = ollama.Client(host=self.base_url)
             response = client.chat(
-    model=self.model,
-    messages=[
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ],
-    options={
-        "temperature": 0.2,
-        "num_predict": 512,
-    },
-)
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
             return response["message"]["content"]
         except Exception as exc:  # noqa: BLE001
             raise GenerationError(
@@ -153,43 +157,83 @@ class GenerationResult:
 
     answer: str
     sources: list[RetrievedChunk]
-    prompt_used: str  # exposed for Debug Mode
+    prompt_used: str            # exposed for Debug Mode
+    system_prompt_used: str      # exposed for Debug Mode
+    insufficient_evidence: bool  # True if we short-circuited without calling the LLM
 
 
 class Generator:
     """
-    Combines retrieved chunks + chat history into a grounded prompt,
-    calls the LLM, and returns the answer alongside its sources.
+    Combines retrieved chunks + chat history into a grounded,
+    mode-aware prompt, calls the LLM, and returns the answer alongside
+    its sources.
     """
 
     def __init__(self, provider: BaseLLMProvider | None = None):
         self.provider = provider or get_llm_provider()
+
+    @staticmethod
+    def _has_sufficient_evidence(retrieved_chunks: list[RetrievedChunk]) -> bool:
+        """
+        Evidence > Model Knowledge (V2 rule): before ever letting the
+        LLM attempt an answer, check whether retrieval actually found
+        anything relevant enough to trust. We check the BEST match's
+        similarity rather than requiring every chunk to clear the bar —
+        one strong hit plus some weaker supporting context is fine;
+        several weak hits and nothing strong is not.
+        """
+        if not retrieved_chunks:
+            return False
+        best_similarity = max(c.similarity for c in retrieved_chunks)
+        return best_similarity >= MIN_EVIDENCE_SIMILARITY
 
     def generate_answer(
         self,
         query: str,
         retrieved_chunks: list[RetrievedChunk],
         chat_history: list[tuple[str, str]] | None = None,
+        mode: ResearchMode | str = ResearchMode.ASK,
     ) -> GenerationResult:
         """
         Produce a grounded answer to `query` using `retrieved_chunks`
-        as the only source of truth.
+        as the only source of truth, framed according to `mode`
+        (Ask / Summarize / Compare / Explain / Find Evidence).
 
-        If retrieved_chunks is empty, we still call the LLM (with an
-        explicit "no context found" note in the prompt) so it responds
-        with the required "not enough information" message rather than
-        guessing from its own parametric knowledge.
+        INSUFFICIENT EVIDENCE HANDLING (V2, mandatory):
+        If the best retrieved chunk's similarity doesn't clear
+        MIN_EVIDENCE_SIMILARITY, we short-circuit with an explicit
+        "insufficient evidence" message WITHOUT calling the LLM at all
+        — this guarantees the required behavior deterministically,
+        rather than hoping the LLM follows the "say so" instruction
+        under a weak-context prompt.
         """
+        if isinstance(mode, str):
+            mode = ResearchMode(mode)
+
+        system_prompt = get_system_prompt(mode)
+        framed_query = build_user_instruction(mode, query)
+
+        if not self._has_sufficient_evidence(retrieved_chunks):
+            return GenerationResult(
+                answer=INSUFFICIENT_EVIDENCE_MESSAGE,
+                sources=retrieved_chunks,  # still shown to the user, per V2 spec
+                prompt_used="(not sent — insufficient evidence, short-circuited before calling the LLM)",
+                system_prompt_used=system_prompt,
+                insufficient_evidence=True,
+            )
+
         context_dicts = [
             {"text": c.text, "source": c.source, "page": c.page, "chunk_id": c.chunk_id}
             for c in retrieved_chunks
         ]
-        prompt = build_rag_prompt(query, context_dicts, chat_history)
+        prompt = build_rag_prompt(framed_query, context_dicts, chat_history)
 
-        answer = self.provider.complete(SYSTEM_PROMPT, prompt)
+        answer = self.provider.complete(system_prompt, prompt)
 
         return GenerationResult(
             answer=answer,
             sources=retrieved_chunks,
             prompt_used=prompt,
+            system_prompt_used=system_prompt,
+            insufficient_evidence=False,
         )

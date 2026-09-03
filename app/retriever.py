@@ -62,9 +62,23 @@ class Retriever:
         self.vector_store = vector_store
         self.embedding_manager = embedding_manager
 
-    def retrieve(self, query: str, top_k: int = TOP_K) -> list[RetrievedChunk]:
+    def retrieve(
+        self,
+        query: str,
+        top_k: int = TOP_K,
+        document_ids: list[str] | None = None,
+    ) -> list[RetrievedChunk]:
         """
         Retrieve the top_k most relevant chunks for a query.
+
+        Args:
+            document_ids: OPTIONAL allow-list restricting retrieval to
+                specific documents (V2 "document selection" feature).
+                None means "search everything indexed". An empty list
+                means "the user deselected every document" and
+                deliberately returns nothing — see vector_store.py's
+                similarity_search docstring for why this distinction
+                is made at the database layer, not after the fact.
 
         Steps (mirrors the RAG retrieval diagram in the project spec):
             query -> query embedding -> ChromaDB search -> top-K chunks
@@ -73,27 +87,32 @@ class Retriever:
         if not query:
             return []
 
-        try:
-            top_k = int(top_k)
-        except (TypeError, ValueError):
-            return []
-
-        if top_k <= 0:
-            return []
-
         query_embedding = self.embedding_manager.embed_query(query)
-        raw_hits = self.vector_store.similarity_search(query_embedding, top_k=top_k)
+        raw_hits = self.vector_store.similarity_search(
+            query_embedding, top_k=top_k, document_ids=document_ids
+        )
 
         chunks: list[RetrievedChunk] = []
+        seen_chunk_ids: set[str] = set()
         for hit in raw_hits:
             meta = hit["metadata"]
+            chunk_id = meta.get("chunk_id", "unknown")
+            # Defensive de-duplication: ChromaDB's upsert-by-id already
+            # prevents duplicate rows, but if a document was ever
+            # processed under two different document_ids (e.g. renamed
+            # and re-uploaded), the same passage could appear twice in
+            # results. We keep only the first (best-ranked) occurrence.
+            if chunk_id in seen_chunk_ids:
+                continue
+            seen_chunk_ids.add(chunk_id)
+
             chunks.append(
                 RetrievedChunk(
                     text=hit["text"],
                     source=meta.get("source", "unknown"),
                     page=meta.get("page", -1),
                     document_id=meta.get("document_id", "unknown"),
-                    chunk_id=meta.get("chunk_id", "unknown"),
+                    chunk_id=chunk_id,
                     distance=hit["distance"],
                 )
             )

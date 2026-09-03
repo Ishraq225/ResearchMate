@@ -1,90 +1,94 @@
 # ResearchMate
 
-**Your AI research assistant for understanding academic papers.**
+**A multi-document AI research assistant powered by Retrieval-Augmented Generation.**
 
-ResearchMate is a Retrieval-Augmented Generation (RAG) application that lets you upload PDF research papers and ask natural-language questions about them. Answers are generated only from retrieved passages of your own documents, with page-level citations — not from the LLM's general "memory."
+ResearchMate lets you upload multiple PDF research papers, choose which of them participate in retrieval, and ask questions, request summaries, run comparisons, get concept explanations, or search for supporting/contradicting evidence — all grounded in the actual retrieved passages, with page-level citations, never invented.
 
 ---
 
-## 1. Project Overview
+## Features
 
-Reading through dense academic papers to find a specific answer is slow. ResearchMate indexes your uploaded papers into a searchable vector database, retrieves the most relevant passages for any question you ask, and has an LLM generate a grounded answer — always showing you exactly which document and page each claim came from.
+- 📚 **Multi-PDF knowledge base** — upload and index any number of papers
+- ☑️ **Document selection/filtering** — choose exactly which uploaded papers participate in a given query
+- 💬 **Conversational Q&A** — follow-up questions ("what are its advantages?") resolve correctly via windowed conversation memory
+- 📄 **Source + page-level citations** — every claim traces back to a specific document and page
+- 🧭 **Research Modes** — Ask, Summarize, Compare, Explain, Find Evidence
+- 🛡️ **Evidence-based responses** — retrieval evidence always outranks the LLM's own pretrained knowledge
+- 🚫 **Insufficient-evidence handling** — the system explicitly declines to guess when retrieval comes up weak, instead of hallucinating
+- 🔁 **Smart re-indexing** — content-hash based change detection avoids re-embedding unchanged documents, and correctly re-indexes a file if its content changed under the same name
+- 🔍 **Debug mode** — inspect retrieved chunks, similarity scores, the active research mode, and the exact prompt sent to the LLM
+- 🔌 **Modular LLM backend** — Ollama (local) or OpenAI (API) via one config value
+- ♻️ **Persistent vector store** — restart the app without losing your indexed knowledge base
 
-This is a **V1 / classical RAG system**, deliberately scoped to demonstrate a clean, understandable pipeline rather than an agentic or multimodal system. See [Limitations](#13-limitations) for what's intentionally out of scope.
+---
 
-## 2. Problem Statement
-
-Large language models are fluent but prone to hallucination when asked about specific documents they weren't trained on — and even when trained on similar material, they can't tell you *which page* a fact came from. ResearchMate solves this by grounding every answer in retrieved, citable passages from documents the user actually uploaded.
-
-## 3. Features
-
-- 📤 Upload one or more PDF research papers
-- ⚙️ One-click processing: extraction → chunking → embedding → indexing
-- 💬 Ask natural-language questions across all uploaded papers
-- 📚 Every answer includes source citations (filename + page + passage)
-- 🔁 Basic multi-turn conversation memory (follow-up questions understand context like "its")
-- 🗑️ Clear/reset the knowledge base at any time
-- 🔍 Debug mode: inspect retrieved chunks, similarity scores, and the exact prompt sent to the LLM
-- 📊 Built-in evaluation harness (retrieval recall, answer correctness)
-- 🔌 Modular LLM backend — swap between a local model (Ollama) and an API model (OpenAI) via one config value
-- ♻️ Persistent vector store — restart the app without re-indexing unchanged documents
-
-## 4. Architecture Diagram
+## Architecture
 
 ```mermaid
 flowchart TD
     A[User uploads PDFs] --> B[ingestion.py<br/>extract text per page]
     B --> C[chunking.py<br/>RecursiveCharacterTextSplitter]
-    C --> D[embeddings.py<br/>EmbeddingManager]
-    D --> E[vector_store.py<br/>ChromaDB - persisted]
-    F[User question] --> G[embeddings.py<br/>embed_query]
-    G --> H[retriever.py<br/>similarity search]
-    E --> H
-    H --> I[prompts.py<br/>build_rag_prompt]
-    I --> J[generator.py<br/>LLM provider]
-    J --> K[Answer + Sources]
-    K --> L[app.py<br/>Streamlit UI]
+    C --> D[pipeline.py<br/>content-hash change detection]
+    D --> E[embeddings.py<br/>EmbeddingManager]
+    E --> F[vector_store.py<br/>ChromaDB - persisted]
+
+    G[User selects documents + mode] --> H[User question]
+    H --> I[embeddings.py<br/>embed_query]
+    I --> J[retriever.py<br/>similarity search + document filter]
+    F --> J
+    J --> K{Evidence<br/>sufficient?}
+    K -- No --> L[Insufficient-evidence response<br/>LLM never called]
+    K -- Yes --> M[research_modes.py<br/>mode-specific prompt]
+    M --> N[memory.py<br/>windowed conversation history]
+    N --> O[generator.py<br/>LLM provider]
+    O --> P[Answer + Sources]
+    P --> Q[app.py<br/>Streamlit chat UI]
 ```
 
-## 5. RAG Pipeline
+## RAG Pipeline
 
 ```
 PDFs
  ↓
-Text extraction        (app/ingestion.py)
+Text extraction              (app/ingestion.py)
  ↓
-Chunking                (app/chunking.py)
+Chunking                      (app/chunking.py)
  ↓
-Embedding generation    (app/embeddings.py)
+Content-hash change check     (app/pipeline.py)
  ↓
-Vector database          (app/vector_store.py)
+Embedding generation           (app/embeddings.py)
  ↓
-Semantic retrieval       (app/retriever.py)
+Vector database (ChromaDB)      (app/vector_store.py)
  ↓
-Relevant chunks
+Document-filtered retrieval      (app/retriever.py)
  ↓
-Prompt + context          (app/prompts.py)
+Evidence-sufficiency gate         (app/generator.py)
  ↓
-LLM                     (app/generator.py)
+Mode-specific prompt              (app/research_modes.py)
  ↓
-Answer + citations
+Conversation history window        (app/memory.py)
+ ↓
+LLM generation                      (app/generator.py)
+ ↓
+Answer + citations                   (app.py)
 ```
 
-## 6. Technology Stack
+## Tech Stack
 
 | Layer | Technology |
 |---|---|
-| UI | Streamlit |
+| UI | Streamlit (`st.chat_message`, `st.chat_input`, checkboxes, radio, metrics) |
 | PDF processing | pypdf |
 | Text splitting | LangChain `RecursiveCharacterTextSplitter` |
 | Embeddings | Sentence Transformers (`all-MiniLM-L6-v2`) |
-| Vector database | ChromaDB (persistent) |
+| Vector database | ChromaDB (persistent, with metadata `where` filtering) |
 | LLM | Modular — Ollama (local) or OpenAI (API) |
+| Change detection | SHA-256 content hashing |
 | Config/secrets | `python-dotenv` |
 | Evaluation | Custom script (`evaluation/evaluate.py`) |
-| Testing | pytest |
+| Testing | pytest (42 tests across ingestion, chunking, embeddings, retrieval, generation, prompts, memory, metadata, pipeline) |
 
-## 7. Installation
+## Installation
 
 ```bash
 git clone <your-repo-url>
@@ -94,22 +98,89 @@ python3 -m venv venv
 source venv/bin/activate        # Windows: venv\Scripts\activate
 
 pip install -r requirements.txt
+cp .env.example .env
 ```
 
-If using **Ollama** (default, local, free): [install Ollama](https://ollama.com) separately and pull a model:
+If using **Ollama** (default, local, free): [install Ollama](https://ollama.com) and pull a model:
 ```bash
 ollama pull llama3.1
 ```
 
-If using **OpenAI** instead, you just need an API key (see below) — no local install needed.
+> **Windows note:** `chromadb` depends on `chroma-hnswlib`, which does not yet publish pre-built wheels for Python 3.13 on Windows. If `pip install` tries to compile it and fails with a Visual C++ error, either install [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) (check "Desktop development with C++"), or simpler: use a Python 3.11/3.12 virtual environment instead, where pre-built wheels are available.
 
-## 8. Environment Variables
+## Usage
 
-Copy the template and fill in your values:
+1. **Start the app**: `streamlit run app.py`
+2. **Upload papers** in the sidebar (multiple PDFs supported)
+3. **Process documents** — extraction, chunking, and embedding happen automatically; unchanged files are skipped on re-runs
+4. **Select sources** — check/uncheck which documents participate in retrieval
+5. **Pick a Research Mode** — Ask / Summarize / Compare / Explain / Find Evidence
+6. **Ask questions** — via the chat input at the bottom
+7. **Review citations** — expand "📚 Sources" under any answer to see filename, page, and passage
+8. Use **New Chat** / **Clear Conversation** to reset the discussion without losing your indexed documents
+
+### Example Questions
+
+- *Ask:* "What is the difference between RAG-Sequence and RAG-Token?"
+- *Summarize:* (select one paper, switch to Summarize mode, submit)
+- *Compare:* "Compare the retrieval strategies used in these papers."
+- *Explain:* "Explain self-attention to a beginner."
+- *Find Evidence:* "Find evidence supporting the claim that retrieval improves factual accuracy."
+
+## Project Structure
+
+```
+ResearchMate/
+│
+├── app/
+│   ├── __init__.py
+│   ├── ingestion.py        # PDF loading + text extraction
+│   ├── chunking.py          # Text splitting with metadata (+ content-hash support)
+│   ├── embeddings.py        # EmbeddingManager (sentence-transformers)
+│   ├── vector_store.py      # ChromaDB wrapper: persistence, filtering, hashing, registry
+│   ├── retriever.py         # Semantic retrieval + document-selection filtering
+│   ├── memory.py            # V2: windowed conversation memory
+│   ├── research_modes.py    # V2: Ask/Summarize/Compare/Explain/Find Evidence prompts
+│   ├── generator.py         # LLM providers + evidence-sufficiency gate + generation
+│   ├── prompts.py           # Base RAG prompt assembly (context + history + question)
+│   ├── pipeline.py          # Orchestrates ingest→chunk→hash-check→embed→store
+│   └── config.py            # Central configuration
+│
+├── data/
+│   ├── documents/           # Uploaded PDFs (git-ignored)
+│   └── vector_store/         # Persisted ChromaDB (git-ignored)
+│
+├── evaluation/
+│   ├── questions.json        # Hand-labeled eval set
+│   └── evaluate.py            # Retrieval recall + answer correctness evaluation
+│
+├── tests/
+│   ├── test_ingestion.py
+│   ├── test_chunking.py
+│   ├── test_embeddings.py
+│   ├── test_retrieval.py       # incl. document filtering + empty-selection behavior
+│   ├── test_generation.py      # incl. insufficient-evidence gating
+│   ├── test_prompts.py
+│   ├── test_memory.py           # incl. New Chat / Clear Conversation behavior
+│   ├── test_metadata.py          # end-to-end metadata preservation
+│   └── test_pipeline.py           # content-hash skip/reprocess/duplicate handling
+│
+├── app.py                    # Streamlit UI
+├── requirements.txt
+├── .env.example
+├── .gitignore
+└── README.md
+```
+
+## Testing
 
 ```bash
-cp .env.example .env
+pytest tests/ -v
 ```
+
+All 42 tests are behavioral (they assert on actual outputs, not just "the function exists"), and most use a real, ephemeral ChromaDB collection with a mocked embedding model — so they run fast and offline while still exercising real retrieval/filtering/persistence logic.
+
+## Environment Variables
 
 | Variable | Description | Default |
 |---|---|---|
@@ -118,91 +189,21 @@ cp .env.example .env
 | `OLLAMA_BASE_URL` | Ollama server URL | `http://localhost:11434` |
 | `OPENAI_API_KEY` | Required only if `LLM_PROVIDER=openai` | — |
 | `OPENAI_MODEL` | OpenAI model name | `gpt-4o-mini` |
-| `CHUNK_SIZE` | Characters per chunk | `800` |
-| `CHUNK_OVERLAP` | Overlap between chunks | `150` |
-| `TOP_K` | Chunks retrieved per query | `5` |
+| `CHUNK_SIZE` / `CHUNK_OVERLAP` | Chunking parameters | `500` / `100` |
+| `TOP_K` | Chunks retrieved per query | `3` |
+| `MEMORY_MAX_TURNS` | Recent conversation turns kept in the prompt | `6` |
+| `MIN_EVIDENCE_SIMILARITY` | Minimum best-match similarity (0-1) before answering | `0.2` |
 | `DEBUG_MODE` | Show debug panel by default | `false` |
 
-`.env` is git-ignored — never commit real secrets.
+`.env` is git-ignored (verify `.gitignore` includes `.env`, `.venv/`, `__pycache__/`, `*.pyc`) — never commit real secrets.
 
-## 9. How to Run
+## Limitations
 
-```bash
-streamlit run app.py
-```
-
-Then open the URL Streamlit prints (usually `http://localhost:8501`).
-
-## 10. Example Usage
-
-1. Upload `RAG.pdf`, `DPR.pdf`, `BERT.pdf` in the sidebar.
-2. Click **Process Documents** — watch the chunk count update.
-3. Ask: *"What is the difference between RAG-Sequence and RAG-Token?"*
-4. Read the grounded answer, then expand **Sources** to see the exact passages and page numbers used.
-5. Ask a follow-up like *"Which one is used more in the original paper?"* — the assistant understands "one" refers to the prior answer.
-6. Toggle **Debug mode** to see the retrieved chunks, similarity scores, and the full prompt sent to the LLM.
-
-## 11. Evaluation Methodology
-
-`evaluation/questions.json` holds a small hand-labeled question set, each with an `expected_answer` and the `source` document it should come from.
-
-Run it (after indexing the corresponding PDFs through the app):
-
-```bash
-python -m evaluation.evaluate
-```
-
-This reports two metrics, kept deliberately simple and inspectable rather than black-box:
-
-- **Retrieval Recall@K** — for each question, did the retriever return at least one chunk from the expected source document within the top-K results? This isolates retrieval quality from generation quality.
-- **Answer correctness rate** — a keyword-overlap check between the generated answer and the expected answer (threshold-based, not an LLM judge, so you can see exactly why a question passed or failed).
-
-Full per-question results are written to `evaluation/results.json` for comparison across runs (e.g. after changing `chunk_size` or `TOP_K`).
-
-## 12. Project Structure
-
-```
-ResearchMate/
-│
-├── app/
-│   ├── __init__.py
-│   ├── ingestion.py       # PDF loading + text extraction
-│   ├── chunking.py         # Text splitting with metadata
-│   ├── embeddings.py       # EmbeddingManager (sentence-transformers)
-│   ├── vector_store.py     # ChromaDB wrapper (persistent)
-│   ├── retriever.py        # Semantic retrieval layer
-│   ├── generator.py        # Modular LLM providers + answer generation
-│   ├── prompts.py          # System + RAG prompt templates
-│   ├── pipeline.py         # Orchestrates ingestion→chunking→embedding→storage
-│   └── config.py           # Central configuration
-│
-├── data/
-│   ├── documents/          # Uploaded PDFs (git-ignored)
-│   └── vector_store/       # Persisted ChromaDB (git-ignored)
-│
-├── evaluation/
-│   ├── questions.json      # Hand-labeled eval set
-│   └── evaluate.py         # Evaluation script
-│
-├── tests/
-│   ├── test_chunking.py
-│   ├── test_ingestion.py
-│   └── test_prompts.py
-│
-├── app.py                  # Streamlit UI
-├── requirements.txt
-├── .env.example
-├── .gitignore
-└── README.md
-```
-
-## 13. Limitations
-
-- No OCR — scanned/image-only PDFs (no text layer) are rejected with a clear error.
-- No re-indexing detection beyond filename-derived document ID — editing a PDF but keeping the same filename won't trigger re-processing in V1.
-- Conversation memory is simple (raw history passed into the prompt), not summarized or windowed — very long conversations will grow the prompt significantly.
-- Answer-correctness evaluation uses keyword overlap, a transparent but crude proxy — not a substitute for human review or an LLM-judge pipeline.
-- No authentication, multi-user support, or cloud deployment configuration — this is a local/single-user V1.
+- No OCR — scanned/image-only PDFs are rejected with a clear error.
+- Conversation memory is a fixed-size window (most recent N turns), not summarization — very long conversations will eventually drop earlier context.
+- Answer-correctness evaluation uses keyword overlap, a transparent but crude proxy — not an LLM-judge pipeline.
+- Document change detection uses whole-file content hashing (not incremental diffing) — any change to the file re-indexes it entirely.
+- No authentication or multi-user support — single-user, local-first V2.
 
 ## 14. Future Improvements
 
@@ -215,11 +216,8 @@ ResearchMate/
 
 ## 15. Screenshots
 
-<img width="1915" height="910" alt="RAG4" src="https://github.com/user-attachments/assets/2e7ef29c-10f5-4968-b171-0a62c3b49398" />
-
-<img width="1791" height="907" alt="Screenshot 2026-08-21 173950" src="https://github.com/user-attachments/assets/3a21b630-a8f8-40fa-bcdd-4d3ba03f7ab0" />
-
+*(placeholder — add screenshots of the sidebar, chat interface, and debug mode here)*
 
 ## 16. Author
 
-Built as a portfolio project demonstrating a complete, understandable, production-inspired RAG pipeline — from PDF ingestion through retrieval, generation, citation, and evaluation.
+Built as a portfolio project demonstrating a complete, understandable, production-inspired multi-document RAG assistant — from ingestion through document-filtered retrieval, mode-aware grounded generation, conversational memory, evidence-based citation, and behavioral testing.

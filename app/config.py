@@ -46,17 +46,6 @@ VECTOR_STORE_DIR = DATA_DIR / "vector_store"    # persisted ChromaDB
 DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
 VECTOR_STORE_DIR.mkdir(parents=True, exist_ok=True)
 
-def _get_int_env(name: str, default: int) -> int:
-    """Safely parse integer environment values, falling back to defaults."""
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return default
-
-
 # ------------------------------------------------------------------
 # CHUNKING
 # ------------------------------------------------------------------
@@ -65,7 +54,7 @@ def _get_int_env(name: str, default: int) -> int:
 #   Too large -> retrieval gets less precise (a chunk about 3 subtopics
 #   might get pulled in for a query about only one of them), and you
 #   waste context-window space on irrelevant text.
-CHUNK_SIZE = _get_int_env("CHUNK_SIZE", 800)
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 800))
 
 # chunk_overlap: how many characters consecutive chunks share.
 #   Without overlap, a sentence that explains a key idea could be
@@ -73,7 +62,7 @@ CHUNK_SIZE = _get_int_env("CHUNK_SIZE", 800)
 #   full idea and retrieval can miss it entirely. Overlap acts as a
 #   safety margin so ideas near chunk edges still appear whole in at
 #   least one chunk.
-CHUNK_OVERLAP = _get_int_env("CHUNK_OVERLAP", 150)
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", 150))
 
 # ------------------------------------------------------------------
 # EMBEDDINGS
@@ -94,7 +83,7 @@ CHROMA_COLLECTION_NAME = os.getenv("CHROMA_COLLECTION_NAME", "researchmate_docs"
 # How many chunks to pull back per query. Configurable because it's
 # a direct trade-off: higher = more recall (less likely to miss the
 # right passage) but more noise in the prompt and higher LLM cost.
-TOP_K = _get_int_env("TOP_K", 3)
+TOP_K = int(os.getenv("TOP_K", 5))
 
 # ------------------------------------------------------------------
 # LLM PROVIDER (kept modular — see generator.py in a later phase)
@@ -111,3 +100,21 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 # DEBUG MODE
 # ------------------------------------------------------------------
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
+
+# ------------------------------------------------------------------
+# V2: CONVERSATION MEMORY
+# ------------------------------------------------------------------
+# How many recent (user, assistant) turns to include in the prompt.
+# See app/memory.py for why a fixed window (not summarization) is used.
+MEMORY_MAX_TURNS = int(os.getenv("MEMORY_MAX_TURNS", 6))
+
+# ------------------------------------------------------------------
+# V2: INSUFFICIENT EVIDENCE THRESHOLD
+# ------------------------------------------------------------------
+# Minimum similarity (0-1, see RetrievedChunk.similarity) that the BEST
+# retrieved chunk must reach before we trust the LLM to answer from it.
+# Below this, we short-circuit with an explicit "insufficient evidence"
+# response rather than risk the LLM leaning on its own pretrained
+# knowledge for a low-relevance retrieval. Tuned conservatively low —
+# it only catches genuinely weak matches, not just "not the top hit".
+MIN_EVIDENCE_SIMILARITY = float(os.getenv("MIN_EVIDENCE_SIMILARITY", 0.2))

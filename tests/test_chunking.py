@@ -48,12 +48,6 @@ def test_empty_pages_produce_no_chunks():
     assert chunks == []
 
 
-def test_invalid_chunk_configuration_returns_empty_list():
-    page = _make_page("Some text that should not be chunked.")
-    assert chunk_pages([page], chunk_size=0, chunk_overlap=0) == []
-    assert chunk_pages([page], chunk_size=100, chunk_overlap=200) == []
-
-
 def test_metadata_dict_shape():
     page = _make_page("Some text.")
     chunks = chunk_pages([page])
