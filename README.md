@@ -216,7 +216,11 @@ All 42 tests are behavioral (they assert on actual outputs, not just "the functi
 
 ## 15. Screenshots
 
-*(placeholder — add screenshots of the sidebar, chat interface, and debug mode here)*
+<img width="1913" height="918" alt="image" src="https://github.com/user-attachments/assets/03a0b604-248f-4fe1-9de6-c0a7bc2ab0ba" />
+
+<img width="1656" height="852" alt="image" src="https://github.com/user-attachments/assets/6f286b9b-f9b3-42aa-ab26-b6755f5855fb" />
+<img width="1915" height="914" alt="image" src="https://github.com/user-attachments/assets/7856bf9d-ff99-4058-a085-cbb4d3d191c5" />
+<img width="1284" height="712" alt="image" src="https://github.com/user-attachments/assets/29b3cbc3-d372-4e76-a43c-694f8ee2909e" />
 
 ## 16. Author
 
